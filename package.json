@@ -1,0 +1,44 @@
+{
+  "name": "nestjs-typeorm-pg-queue",
+  "version": "0.0.0",
+  "description": "Nest.jsqueue Transporter Server based on postgres sql",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "prebuild": "rm -rf dist",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@nestjs/common": "10.4.15",
+    "@nestjs/microservices": "^10.3.10",
+    "@nestjs/typeorm": "10.0.0",
+    "rxjs": "7.8.0",
+    "typeorm": "0.3.21"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3",
+    "ts-node": "^10.9.1",
+    "pg": "8.8.0"
+  },
+  "peerDependencies": {
+    "@nestjs/common": "^10.4.15",
+    "@nestjs/microservices": "^10.3.10",
+    "@nestjs/typeorm": "^10.0.0",
+    "typeorm": "^0.3.20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gring2/nestjs-typeorm-pg-queue.git"
+  },
+  "keywords": [
+    "nestjs",
+    "queue",
+    "postgres sql"
+  ],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/gring2/nestjs-typeorm-pg-queue/issues"
+  },
+  "homepage": "https://github.com/gring2/nestjs-typeorm-pg-queue#readme"
+}
