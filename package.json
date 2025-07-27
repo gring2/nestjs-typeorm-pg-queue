@@ -35,6 +35,12 @@
     "queue",
     "postgres sql"
   ],
+  "files": [
+    "dist/*",
+    "package.json",
+    "README.md",
+    "lib/type.d.ts"
+  ],
   "author": "",
   "license": "ISC",
   "bugs": {
