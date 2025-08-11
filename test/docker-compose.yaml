@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  postgres-test:
+    image: postgres:16
+    container_name: pg-queue-test-db
+    environment:
+      POSTGRES_USER: testuser
+      POSTGRES_PASSWORD: testpassword
+      POSTGRES_DB: testdb
+    ports:
+      - '5433:5432' # Map to host port 5433 to avoid conflicts
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U testuser -d testdb" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pg-test-data:/var/lib/postgresql/data
+
+volumes:
+  pg-test-data:
