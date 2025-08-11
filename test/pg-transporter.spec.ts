@@ -49,7 +49,8 @@ class FailJob extends TestJob {}
 
 @Entity()
 class SlowJob extends TestJob {}
-
+@Entity()
+class SerialDrainJob extends TestJob {}
 // --- Test Suite ---
 describe('PgTransporter', () => {
   let dataSource: DataSource;
@@ -74,7 +75,7 @@ describe('PgTransporter', () => {
       username: 'testuser',
       password: 'testpassword',
       database: 'testdb',
-      entities: [TestJob, SerialJob, ParallelJob, FailJob, SlowJob],
+      entities: [TestJob, SerialJob, ParallelJob, FailJob, SlowJob, SerialDrainJob],
       synchronize: true, // Creates schema on initial connection
     });
 
@@ -98,6 +99,61 @@ describe('PgTransporter', () => {
   beforeEach(async () => {
     await dataSource.synchronize(true);
   });
+
+  it('should drain the entire queue for a serialized topic before pausing to poll', async () => {
+    const processingTimestamps: number[] = [];
+    const BATCH_SIZE = 2;
+    const TOTAL_JOBS = 3; // More than one batch
+
+    const transporter = PgTransporterClient.connect(em)
+      .addTopics(
+        new Map([
+          [
+            SerialDrainJob,
+            {
+              frequent: 500, // A long interval to prove it's not re-polling
+              amount: BATCH_SIZE,
+              serialize: true,
+            },
+          ],
+        ]),
+      )
+      .connect();
+
+    transporter.addHandler(SerialDrainJob, async (job: SerialDrainJob) => {
+      await sleep(50); // Simulate work
+      processingTimestamps.push(Date.now());
+      return of(null);
+    });
+
+
+
+    transporter.listen(() => {});
+    // make sure no jobs in listen.
+    await sleep(1000);
+
+    // Insert 3 jobs
+    for (let i = 0; i < TOTAL_JOBS; i++) {
+      await em.save(em.create(SerialDrainJob, {}));
+    }
+
+    // Wait long enough for all 3 jobs to be processed, but less than the polling interval
+    await sleep(1000);
+
+    // Assertions
+    expect(processingTimestamps.length).toBe(TOTAL_JOBS);
+
+    // Check that the time between the last job of the first batch (job #2)
+    // and the first job of the second batch (job #3) is very short,
+    // proving it fetched the next batch immediately.
+    const timeBetweenBatches = processingTimestamps[2] - processingTimestamps[1];
+    expect(timeBetweenBatches).toBeLessThan(1000); // Should be very quick, definitely not 5000ms
+
+    const jobsInDb = await em.countBy(SerialDrainJob, { status: 'succeed' });
+    expect(jobsInDb).toBe(TOTAL_JOBS);
+
+    await transporter.close();
+  }, 10000);
 
   it('should process jobs sequentially when serialize is true', async () => {
     const processedOrder: string[] = [];

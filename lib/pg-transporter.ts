@@ -1,7 +1,7 @@
 import { Logger } from '@nestjs/common';
 import { CustomTransportStrategy, Server } from '@nestjs/microservices';
 import {
-  catchError, concatMap,
+  catchError,
   exhaustMap,
   from,
   interval,
@@ -65,6 +65,7 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
   }
 
 
+
   handleListen() {
     const observables = Array.from(this.event_map.entries()).map(
       ([entityClass, options]) => {
@@ -75,27 +76,6 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
           serialize,
         } = options;
 
-        // 1. Polling Stream: Fetches a batch of jobs for this specific topic.
-        // exhaustMap prevents new fetches while the current batch is still processing.
-        const source$ = interval(intervalTime).pipe(
-          exhaustMap(() =>
-            from(this.fetch(entityClass, amount, constraint)).pipe(
-              catchError((error) => {
-                const entityName =
-                  typeof entityClass === 'function'
-                    ? entityClass.name
-                    : String(entityClass);
-                Logger.error(
-                  `Error fetching jobs for ${entityName}:`,
-                  error.stack,
-                );
-                return []; // Return an empty array to prevent the stream from dying
-              }),
-            ),
-          ),
-        );
-
-        // 2. Processing Logic: A reusable function to handle a single job entity.
         const processEntity = async (entity: any) => {
           this.activeProcesses++;
           const handler = this.getHandlers().get(entity.constructor);
@@ -113,7 +93,6 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
 
             if (result instanceof Observable) {
               if (serialize) {
-                // Serialized jobs run to completion, ignoring timeout
                 await lastValueFrom(result);
               } else {
                 await lastValueFrom(
@@ -126,7 +105,6 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
             if (entity.hasOwnProperty('error_msg')) {
               entity.error_msg = e instanceof Error ? e.stack : e.message;
             }
-            // Retry logic
             if (entity.retry < 6) {
               entity.status = 'pending';
             } else {
@@ -134,25 +112,91 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
               entity.status = 'failed';
             }
           } finally {
-            // Ensure the entity is always saved and the process counter is decremented
             await this.em.save(entity.constructor, entity);
             this.activeProcesses--;
           }
         };
 
-        // 3. Attach the right processing strategy (the "Assembly Line" type)
+        // --- STRATEGY SELECTION ---
+
         if (serialize) {
-          // concatMap processes jobs one-by-one for this topic.
-          return source$.pipe(concatMap(processEntity));
+          // NEW "BATCH DRAIN" STRATEGY for serialized jobs.
+          return interval(intervalTime).pipe(
+            exhaustMap(() =>
+              new Observable((subscriber) => {
+                let isCancelled = false;
+                const drainQueue = async () => {
+                  while (!isCancelled) {
+                    // Fetch a batch of jobs from the DB.
+                    const jobs = await this.fetchAll(entityClass, amount, constraint);
+
+                    if (jobs.length === 0) {
+                      // The queue is empty. Break the loop to stop draining.
+                      // The outer `exhaustMap` will now wait for the next `interval` tick.
+                      break;
+                    }
+
+                    // Process the entire batch sequentially from memory.
+                    for (const job of jobs) {
+                      if (isCancelled) break;
+                      await processEntity(job);
+                    }
+                    // After processing the batch, the loop continues to fetch another one immediately.
+                  }
+                  // This completes only when the drain loop breaks (queue is empty).
+                  subscriber.complete();
+                };
+
+                drainQueue().catch((err) => subscriber.error(err));
+
+                // Cleanup function to stop the drain loop if the transporter is closed.
+                return () => {
+                  isCancelled = true;
+                };
+              }),
+            ),
+          );
         } else {
-          // mergeMap processes jobs in parallel, up to the 'amount' limit for this topic.
+          // EXISTING "BATCH" STRATEGY for parallel jobs.
+          const source$ = interval(intervalTime).pipe(
+            exhaustMap(() =>
+              from(this.fetch(entityClass, amount, constraint)).pipe(
+                catchError((error) => {
+                  const entityName =
+                    typeof entityClass === 'function'
+                      ? entityClass.name
+                      : String(entityClass);
+                  Logger.error(
+                    `Error fetching jobs for ${entityName}:`,
+                    error.stack,
+                  );
+                  return [];
+                }),
+              ),
+            ),
+          );
           return source$.pipe(mergeMap(processEntity, amount));
         }
       },
     );
 
-    // 4. Run all topic streams concurrently.
     return merge(...observables);
+  }
+
+  /**
+   * Helper to collect all results from the async fetch generator into an array.
+   * This is used by the "batch drain" strategy.
+   */
+  private async fetchAll(
+    target: EntityTarget<any>,
+    cnt: number,
+    constraint?: Record<string, any>,
+  ): Promise<any[]> {
+    const results:any[] = [];
+    for await (const job of this.fetch(target, cnt, constraint)) {
+      results.push(job);
+    }
+    return results;
   }
 
   async close() {
@@ -210,8 +254,8 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
                    RETURNING "${repo.metadata.tableName}".*
     `;
 
-    const rows = await this.em.query(query, params);
-    for (const job of rows[0].filter((r) => r)) {
+    const [rows] = await this.em.query(query, params);
+    for (const job of rows.filter((r) => r)) {
       const entity = this.em.create(target, job);
       yield entity;
     }
