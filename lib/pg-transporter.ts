@@ -1,19 +1,26 @@
 import { Logger } from '@nestjs/common';
 import { CustomTransportStrategy, Server } from '@nestjs/microservices';
 import {
-  catchError,
+  catchError, concatMap,
   exhaustMap,
   from,
   interval,
   lastValueFrom,
-  merge,
+  merge, mergeMap,
   Observable,
   Subscription,
-  switchMap,
   timeout,
 } from 'rxjs';
 import { EntityManager, EntityTarget, LessThan, MoreThanOrEqual } from 'typeorm';
 
+// Define a reusable, clear type for topic options
+type TopicOptions = {
+  frequent: number;
+  amount: number;
+  constraint?: Record<string, any>;
+  timeout?: number;
+  serialize?: boolean; // Use boolean for better type safety
+};
 export class PgTransporter extends Server implements CustomTransportStrategy {
   private handlers?: Subscription;
   private activeProcesses = 0; // Add this counter
@@ -21,12 +28,7 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
     private readonly em: EntityManager,
     private readonly event_map: Map<
       EntityTarget<any>,
-      {
-        frequent: number;
-        amount: number;
-        constraint?: Record<string, any>;
-        timeout?: number;
-      }
+      TopicOptions
     >,
     private readonly timeout = 30000,
     private readonly error_handler_cb?: (error: Error) => void,
@@ -59,69 +61,97 @@ export class PgTransporter extends Server implements CustomTransportStrategy {
   }
 
   subscribeHandler() {
-    this.handlers = this.handleListen()
-      .pipe(
-        switchMap(async (entity) => {
+    this.handlers = this.handleListen().subscribe();
+  }
 
-          this.activeProcesses++; // Increment before processing
+
+  handleListen() {
+    const observables = Array.from(this.event_map.entries()).map(
+      ([entityClass, options]) => {
+        const {
+          frequent: intervalTime,
+          amount,
+          constraint,
+          serialize,
+        } = options;
+
+        // 1. Polling Stream: Fetches a batch of jobs for this specific topic.
+        // exhaustMap prevents new fetches while the current batch is still processing.
+        const source$ = interval(intervalTime).pipe(
+          exhaustMap(() =>
+            from(this.fetch(entityClass, amount, constraint)).pipe(
+              catchError((error) => {
+                const entityName =
+                  typeof entityClass === 'function'
+                    ? entityClass.name
+                    : String(entityClass);
+                Logger.error(
+                  `Error fetching jobs for ${entityName}:`,
+                  error.stack,
+                );
+                return []; // Return an empty array to prevent the stream from dying
+              }),
+            ),
+          ),
+        );
+
+        // 2. Processing Logic: A reusable function to handle a single job entity.
+        const processEntity = async (entity: any) => {
+          this.activeProcesses++;
           const handler = this.getHandlers().get(entity.constructor);
-          console.log(this.getHandlers())
+
           if (!handler) {
-            this.activeProcesses--; // Decrement if no handler
+            Logger.warn(`No handler found for job type: ${entity.constructor.name}`);
+            this.activeProcesses--;
             return;
           }
 
           try {
-            const r = await handler(entity);
+            const result = await handler(entity);
             const { timeout: entity_timeout } =
-              this.event_map.get(entity.constructor) || {};
+            this.event_map.get(entity.constructor) || {};
 
-            if (r instanceof Observable) {
-              await lastValueFrom(
-                r.pipe(timeout(entity_timeout || this.timeout)),
-              );
+            if (result instanceof Observable) {
+              if (serialize) {
+                // Serialized jobs run to completion, ignoring timeout
+                await lastValueFrom(result);
+              } else {
+                await lastValueFrom(
+                  result.pipe(timeout(entity_timeout || this.timeout)),
+                );
+              }
             }
-
             entity.status = 'succeed';
           } catch (e: any) {
             if (entity.hasOwnProperty('error_msg')) {
               entity.error_msg = e instanceof Error ? e.stack : e.message;
             }
+            // Retry logic
             if (entity.retry < 6) {
-              // 5 times retry
               entity.status = 'pending';
             } else {
               this.error_handler_cb?.(e);
-
               entity.status = 'failed';
             }
           } finally {
+            // Ensure the entity is always saved and the process counter is decremented
             await this.em.save(entity.constructor, entity);
-            this.activeProcesses--; // Decrement after save
+            this.activeProcesses--;
           }
-        }),
-      )
-      .subscribe();
-  }
+        };
 
-  handleListen() {
-    const observables = Array.from(this.event_map.entries()).map(
-      ([entityClass, { frequent: intervalTime, amount, constraint }]) =>
-        interval(intervalTime).pipe(
-          exhaustMap(() =>
-            from(this.fetch(entityClass, amount, constraint)).pipe(
-              catchError((error) => {
-                Logger.error(
-                  `Error fetching results for ${entityClass}:`,
-                  error,
-                );
-                return [];
-              }),
-            ),
-          ),
-        ),
+        // 3. Attach the right processing strategy (the "Assembly Line" type)
+        if (serialize) {
+          // concatMap processes jobs one-by-one for this topic.
+          return source$.pipe(concatMap(processEntity));
+        } else {
+          // mergeMap processes jobs in parallel, up to the 'amount' limit for this topic.
+          return source$.pipe(mergeMap(processEntity, amount));
+        }
+      },
     );
 
+    // 4. Run all topic streams concurrently.
     return merge(...observables);
   }
 
@@ -229,6 +259,7 @@ export class PgTransporterClient {
         frequent: number;
         amount: number;
         constraint?: Record<string, any>;
+        serialize?: true
       }
     >,
   ) {
