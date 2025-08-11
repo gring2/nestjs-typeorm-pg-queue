@@ -236,18 +236,13 @@ export class PgTransporterClient {
   private em?: EntityManager;
   private event_map?: Map<
     EntityTarget<any>,
-    {
-      frequent: number;
-      amount: number;
-      constraint?: Record<string, any>;
-    }
+    TopicOptions
   >;
   private timeout: number = 30000;
   private error_handler_cb?: (error: Error) => void;
 
   static connect(em: EntityManager) {
     const client = new PgTransporterClient();
-
     client.em = em;
     return client;
   }
@@ -255,12 +250,7 @@ export class PgTransporterClient {
   addTopics(
     event_map: Map<
       EntityTarget<any>,
-      {
-        frequent: number;
-        amount: number;
-        constraint?: Record<string, any>;
-        serialize?: true
-      }
+      TopicOptions
     >,
   ) {
     this.event_map = event_map;
@@ -281,7 +271,7 @@ export class PgTransporterClient {
   }
 
   connect() {
-    if (!this.em || !this.event_map) throw new Error();
+    if (!this.em || !this.event_map) throw new Error(  'EntityManager and event_map must be configured before connecting.',);
     return new PgTransporter(
       this.em,
       this.event_map,
